@@ -43,8 +43,8 @@ class Solver:
 
     # nu is the multiplier corresponding to the equality constraint Bx = b.
     # _lambda is the mulitplier corresponding to the inequality constraint x>=0.
-    # OBS: This line search is not for a general problem. It has been modified to the special case of logistic regression with
-    # ell-1 regularization.
+    # OBS: This line search is not for a general problem. It has been modified 
+    # to the special case of logistic regression with ell-1 regularization.
     def backtracking(self, x, _lambda, nu, dx, dlambda, dnu, t, original_residual_norm):
         indices_1 = np.where(dlambda < 0)[0]
         if indices_1.size == 0:
@@ -93,8 +93,9 @@ class Solver:
     Note that x0 and _lambda0 must be strictly positive. 
     """
     def solve(self, max_iter, x0, _lambda0, nu0, mu):
-        m, d = self.B.shape                              # Local d.
-        x, _lambda, nu = x0, _lambda0, nu0 
+        m, d = self.B.shape                              # d is the dimension of the optimization variable 
+        x, _lambda, nu = x0, _lambda0, nu0               # (which is not the same as the dimension of the feature vector)
+         
 
         # Define parameters for tracking the progress.
         times, residual_norms, residual_opt_conds = [], [], []
@@ -102,7 +103,6 @@ class Solver:
         rcent, rfeas = np.zeros((max_iter, )), np.zeros((max_iter, ))
         tic = time()
 
-        # Iterations.
         for iter in range(0, max_iter):
             if(iter%10 == 0):
                 print("Iteration: ", iter)
@@ -121,6 +121,7 @@ class Solver:
             row3 = np.concatenate((self.B, np.zeros((m, d)), np.zeros((m, m))), axis = 1)
             coeff_matrix = np.concatenate((row1, row2, row3), axis = 0)
 
+            
             _rp = self.B @ x - self.b
             _rd = grad - _lambda + self.B.T @ nu
             _rcent = np.multiply(_lambda, x) - 1/t
@@ -142,8 +143,33 @@ class Solver:
             dx = dir[0:d]
             dlambda = dir[d:2*d]
             dnu = dir[2*d:]
-        
 
+            ###############################################################################
+            # Apply one correction step. The extra cost is one Hessian-vector product.
+            # In this naive implementation we compute the Hessian-vector product 
+            # by actually forming the true Hessian... The point is to see if 
+            # adding a correction step helps in terms of the achieved accuracy.
+            if self.sketching_strategy == 3 and self.correction:
+                print("Applying correction step.")
+                sketched_hessian = self.hess                                         # Store the sketched Hessian 
+                self.sketching_strategy = 1              
+                self.evaluate_hessian(x)                                             # Evaluate the true Hessian
+                self.sketching_strategy = 3                                          
+                correction_term = (self.hess - sketched_hessian)@dx               
+
+                new_rhs = residuals
+                new_rhs[0:d] = new_rhs[0:d] + correction_term
+
+                # We could factor coeff_matrix earlier and reuse the factorization,
+                # but profiling shows that the linear system solve is (for our problems)
+                # very cheap compared to forming the sketched Hessian.
+                dir = -LA.solve(coeff_matrix, residuals)
+                dx = dir[0:d]
+                dlambda = dir[d:2*d]
+                dnu = dir[2*d:]
+
+
+            ################################################################################
             alpha = self.backtracking(x, _lambda, nu, dx, dlambda, dnu, t, LA.norm(residuals))      
             alphas[iter] = alpha
 
@@ -157,26 +183,45 @@ class Solver:
 
 
 
-class Logistic_regression_L1_regularization(Solver):
-    """ 
+class log_reg_ell1_solver(Solver):
+    """ A value, gradient and Hessian oracle for the objective function 
+        when logistic regression with ell1-regularization is formulated on 
+        the form
+
+            min          f(x)
+            subject to   Bx = b,
+                         x >= 0.
+
+        
+        B, b - constraint data
+        gamma - regularization parameter
+        A, y - data matrix and labels
+        alpha_backtrack, beta_backtrack - parameters for backtracking
+        
+        sketching_strategy - either 1 or 3. 1 = no sketch. 3 = countsketch.
+        correction - True if one correction step should be used when computing
+                     the sketched search direction.
 
     """
     def __init__(self, B, b, gamma, A, y, alpha_backtrack, beta_backtrack,
-                 sketching_size, sketching_strategy):
+                 sketching_size, sketching_strategy, correction):
         super().__init__(B, b, alpha_backtrack, beta_backtrack)                                                       
-        self.n, self.original_d = A.shape                                                # Number of data points.
-        self.A = A 
-        self.sketching_size = sketching_size 
+        self.n, self.original_d = A.shape                                                # Number of data points and the original dimension of the feature vector.
+        self.A = A                                                                       
+        self.sketching_size = sketching_size  
         self.sketching_strategy = sketching_strategy
-        self.y = y                                                         # Must be a column vector with one dimension (not zero).
-        self.yA = self.y * self.A 
-        self.gamma = gamma
+        self.y = y                                                                       # Must be a column vector with one dimension (not zero).
+        self.yA = self.y * self.A                                                        # The data matrix with scaled columns. Just for simplicity.
+        self.gamma = gamma                                                               
+        self.correction = correction
 
     def evaluate_grad(self, w):
         x_plus = w[0:self.original_d]
         x_minus = w[self.original_d:2*self.original_d]
+        
         #cached_quantity1_cmp = self.A.T * self.y.reshape(len(self.y), )
         cached_quantity1 = np.exp(self.yA @ (x_plus - x_minus))
+        
         dh = np.divide(cached_quantity1, 1 + cached_quantity1)
         #grad_cmp = 1/self.n*np.vstack((cached_quantity1_cmp @ dh, -cached_quantity1_cmp @ dh,
         #                           np.zeros((self.r, 1)), np.zeros((self.r, 1))))
@@ -191,7 +236,6 @@ class Logistic_regression_L1_regularization(Solver):
     def evaluate_grad_precomputed(self, Ax, Adx, alpha):
         # First argument corresponds to y*A(x_plus - x_minus). Second argument corresponds to
         # y*A(dx_plus - dx_minus).
-
         cached_quantity1 = np.exp(Ax + alpha*Adx)
         dh = np.divide(cached_quantity1, 1 + cached_quantity1)
         #grad_cmp = 1/self.n*np.vstack((cached_quantity1_cmp @ dh, -cached_quantity1_cmp @ dh,
@@ -238,8 +282,13 @@ class Logistic_regression_L1_regularization(Solver):
 
 
 
-
-def build_logistic_regression_ell1_regularization_problem_instance(n, d, rho):
+""" Builds a problem of logistic regression with ell-1 regularization.
+    The data comes from a Gaussian distribution.
+    n = number of data points
+    d = dimension of feature vector
+    rho = parameter used to build the covariance matrix
+"""
+def build_log_reg_ell1_problem(n, d, rho):
 
 
     # Generate labels and data matrix.
@@ -248,12 +297,12 @@ def build_logistic_regression_ell1_regularization_problem_instance(n, d, rho):
         y[i] = 1 if np.random.random() < 0.5 else -1
 
     # Generate data matrix A.
-    covariance_matrix = np.zeros((d, d))
+    cov_matrix = np.zeros((d, d))
     for i in range(0, d):
         for j in range(0, d):
-            covariance_matrix[i, j] = 2*(rho**np.abs(i-j))
+            cov_matrix[i, j] = 2*(rho**np.abs(i-j))
 
-    A = np.random.multivariate_normal(np.zeros((d, )), covariance_matrix, size=n)
+    A = np.random.multivariate_normal(np.zeros((d, )), cov_matrix, size=n)
 
 
     # Build constraint matrix.
